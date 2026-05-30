@@ -16,7 +16,7 @@ def get_prayer_times(city: str = "Astana", country: str = "Kazakhstan"):
         "method": 99,
         "methodSettings" : "15, null, 15"
     }
-    
+   
     response = requests.get(url, params=params)
     data = response.json() 
     
