@@ -1,152 +1,239 @@
-import requests
-from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-app = FastAPI()
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from timezonefinder import TimezoneFinder
+except ImportError:
+    TimezoneFinder = None
 
 
-def geocode_location(query: str) -> dict:
-    """
-    Принимает любое название (город, село, район) и возвращает
-    координаты через OpenStreetMap Nominatim — бесплатно, без API-ключа.
-    """
-    url = "https://nominatim.openstreetmap.org/search"
+app = FastAPI(title="iNamaz API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+ALADHAN_URL = "https://api.aladhan.com/v1/timings"
+HEADERS = {
+    "User-Agent": "iNamaz/1.0 (prayer-times-backend)",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+}
+
+PRAYER_NAME_MAP = {
+    "Fajr": "Фаджр",
+    "Sunrise": "Восход",
+    "Dhuhr": "Зухр",
+    "Asr": "Аср",
+    "Maghrib": "Магриб",
+    "Isha": "Иша",
+}
+
+
+async def fetch_json(url: str, params: dict[str, Any], timeout: int = 10) -> Any:
+    try:
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Не удалось получить данные от внешнего сервиса: {exc}",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Внешний сервис вернул некорректный JSON.",
+        ) from exc
+
+
+async def geocode_location(query: str) -> dict[str, Any] | None:
+    city = query.strip()
+    if not city:
+        return None
+
     params = {
-        "q": query,
+        "q": city,
         "format": "json",
         "limit": 5,
-        "countrycodes": "kz",   # ищем только в Казахстане
+        "countrycodes": "kz",
         "addressdetails": 1,
     }
-    headers = {
-        # Nominatim требует User-Agent
-        "User-Agent": "PrayerTimesApp/1.0"
-    }
-    resp = requests.get(url, params=params, headers=headers, timeout=10)
-    results = resp.json()
+
+    results = await fetch_json(NOMINATIM_URL, params)
 
     if not results:
-        # Если в Казахстане не нашли — пробуем без ограничения страны
         params.pop("countrycodes")
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        results = resp.json()
+        results = await fetch_json(NOMINATIM_URL, params)
 
     if not results:
         return None
 
     best = results[0]
+    lat = float(best["lat"])
+    lon = float(best["lon"])
+    print(f"geocode_location: query={city!r}, lat={lat}, lon={lon}")
+
     return {
         "display_name": best["display_name"],
-        "lat": float(best["lat"]),
-        "lon": float(best["lon"]),
+        "lat": lat,
+        "lon": lon,
+        "address": best.get("address", {}),
     }
 
 
-def get_timings_by_coords(lat: float, lon: float) -> dict:
-    """
-    Получает время намаза по координатам через Aladhan API.
-    Метод 99 с настройкой 15° для Казахстана.
-    """
-    url = "http://api.aladhan.com/v1/timings"
-    import datetime
-    today = datetime.date.today().strftime("%d-%m-%Y")
+async def get_timezone_name(lat: float, lon: float) -> str:
+    if TimezoneFinder:
+        tf = TimezoneFinder()
+        return tf.timezone_at(lat=lat, lng=lon) or "Asia/Almaty"
+    return "Asia/Almaty"
 
+
+async def get_tzinfo(tz_name: str) -> timezone | ZoneInfo:
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        # Kazakhstan has used UTC+5 nationwide since 2024. This keeps Windows
+        # environments without the tzdata package working for the app's main market.
+        if tz_name.startswith("Asia/"):
+            return timezone(timedelta(hours=5), name=tz_name)
+        return timezone.utc
+
+
+async def get_timezone_info(lat: float, lon: float) -> dict[str, str]:
+    tz_name = await get_timezone_name(lat, lon)
+    tz = await get_tzinfo(tz_name)
+    current_time = datetime.now(tz)
+
+    return {
+        "timezone": tz_name,
+        "current_time": current_time.strftime("%H:%M:%S"),
+        "current_date": current_time.strftime("%d-%m-%Y"),
+        "utc_offset": current_time.strftime("%z"),
+    }
+
+
+async def get_local_date(lat: float, lon: float) -> str:
+    tz = await get_tzinfo(await get_timezone_name(lat, lon))
+    return datetime.now(tz).strftime("%d-%m-%Y")
+
+
+async def get_timings_by_coords(lat: float, lon: float) -> dict[str, str]:
     params = {
         "latitude": lat,
         "longitude": lon,
         "method": 99,
         "methodSettings": "15,null,15",
-        "date": today,
+        "date": await get_local_date(lat, lon),
     }
-    resp = requests.get(url, params=params, timeout=10)
-    data = resp.json()
+
+    data = await fetch_json(ALADHAN_URL, params)
 
     if data.get("code") != 200:
-        raise HTTPException(status_code=502, detail="Ошибка при получении времени намаза")
+        raise HTTPException(
+            status_code=502,
+            detail="Ошибка при получении времени намаза.",
+        )
 
-    return data["data"]["timings"]
+    timings = data["data"]["timings"]
+    return {ru_name: timings[api_name] for api_name, ru_name in PRAYER_NAME_MAP.items()}
+
+
+async def get_place_name(result: dict[str, Any]) -> str:
+    address = result.get("address", {})
+    return (
+        address.get("city")
+        or address.get("town")
+        or address.get("village")
+        or address.get("hamlet")
+        or address.get("suburb")
+        or result["display_name"].split(",")[0]
+    )
+
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {
+        "message": "iNamaz API работает.",
+        "example": "/api/prayer-times?location=Almaty",
+    }
 
 
 @app.get("/api/prayer-times")
-def get_prayer_times(location: str = "Астана"):
-    """
-    Принимает любое название места на любом языке (казахский, русский, английский).
-    Возвращает время намаза для этого места.
+async def get_prayer_times(
+    location: Annotated[str | None, Query(description="Город, например Almaty")] = None,
+) -> dict[str, Any]:
+    city = (location or "").strip() or "Astana"
 
-    Примеры:
-      /api/prayer-times?location=Алматы
-      /api/prayer-times?location=Шымкент
-      /api/prayer-times?location=Туркестан
-      /api/prayer-times?location=Жанаозен
-      /api/prayer-times?location=аул Карабулак
-    """
-    geo = geocode_location(location)
-
+    geo = await geocode_location(city)
     if not geo:
         raise HTTPException(
             status_code=404,
-            detail=f"Место '{location}' не найдено. Попробуйте написать иначе."
+            detail=f"Место '{city}' не найдено. Попробуйте написать город иначе.",
         )
 
-    timings = get_timings_by_coords(geo["lat"], geo["lon"])
+    timezone = await get_timezone_info(geo["lat"], geo["lon"])
+    prayer_times = await get_timings_by_coords(geo["lat"], geo["lon"])
 
     return {
-        "searched": location,
+        "city": city,
+        "searched": city,
         "found": geo["display_name"],
         "coordinates": {
             "lat": geo["lat"],
             "lon": geo["lon"],
         },
-        "prayer_times": {
-            "Фаджр":   timings["Fajr"],
-            "Восход":  timings["Sunrise"],
-            "Зухр":    timings["Dhuhr"],
-            "Аср":     timings["Asr"],
-            "Магриб":  timings["Maghrib"],
-            "Иша":     timings["Isha"],
-        }
+        "timezone": timezone,
+        "prayer_times": prayer_times,
     }
 
 
 @app.get("/api/search-suggestions")
-def search_suggestions(q: str):
-    """
-    Возвращает список подсказок для строки поиска.
-    Используй этот эндпоинт пока пользователь печатает.
-    """
-    if len(q) < 2:
+async def search_suggestions(q: str = Query(min_length=1)) -> dict[str, list[dict[str, Any]]]:
+    query = q.strip()
+    if len(query) < 2:
         return {"suggestions": []}
 
-    url = "https://nominatim.openstreetmap.org/search"
     params = {
-        "q": q,
+        "q": query,
         "format": "json",
         "limit": 7,
         "countrycodes": "kz",
         "addressdetails": 1,
     }
-    headers = {"User-Agent": "PrayerTimesApp/1.0"}
-    resp = requests.get(url, params=params, headers=headers, timeout=8)
-    results = resp.json()
 
+    results = await fetch_json(NOMINATIM_URL, params, timeout=8)
     suggestions = []
-    for r in results:
-        addr = r.get("address", {})
-        # Формируем красивое короткое название
-        name = (
-            addr.get("city")
-            or addr.get("town")
-            or addr.get("village")
-            or addr.get("hamlet")
-            or addr.get("suburb")
-            or r["display_name"].split(",")[0]
+
+    for result in results:
+        lat = float(result["lat"])
+        lon = float(result["lon"])
+        address = result.get("address", {})
+
+        suggestions.append(
+            {
+                "name": await get_place_name(result),
+                "region": address.get("state") or address.get("county") or "",
+                "full": result["display_name"],
+                "lat": lat,
+                "lon": lon,
+                "timezone": await get_timezone_info(lat, lon),
+            }
         )
-        region = addr.get("state") or addr.get("county") or ""
-        suggestions.append({
-            "name": name,
-            "region": region,
-            "full": r["display_name"],
-            "lat": float(r["lat"]),
-            "lon": float(r["lon"]),
-        })
 
     return {"suggestions": suggestions}
