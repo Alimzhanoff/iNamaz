@@ -39,6 +39,69 @@ PRAYER_NAME_MAP = {
     "Isha": "Иша",
 }
 
+STATIC_KZ_CITIES = {
+    "astana": ("Астана", 51.1694, 71.4491),
+    "астана": ("Астана", 51.1694, 71.4491),
+    "nur-sultan": ("Астана", 51.1694, 71.4491),
+    "нур-султан": ("Астана", 51.1694, 71.4491),
+    "almaty": ("Алматы", 43.2389, 76.8897),
+    "алматы": ("Алматы", 43.2389, 76.8897),
+    "shymkent": ("Шымкент", 42.3417, 69.5901),
+    "shimkent": ("Шымкент", 42.3417, 69.5901),
+    "шымкент": ("Шымкент", 42.3417, 69.5901),
+    "karaganda": ("Караганда", 49.8047, 73.1094),
+    "караганда": ("Караганда", 49.8047, 73.1094),
+    "aktobe": ("Актобе", 50.2839, 57.1670),
+    "актобе": ("Актобе", 50.2839, 57.1670),
+    "taraz": ("Тараз", 42.9000, 71.3667),
+    "тараз": ("Тараз", 42.9000, 71.3667),
+    "pavlodar": ("Павлодар", 52.2873, 76.9674),
+    "павлодар": ("Павлодар", 52.2873, 76.9674),
+    "ust-kamenogorsk": ("Усть-Каменогорск", 49.9483, 82.6275),
+    "усть-каменогорск": ("Усть-Каменогорск", 49.9483, 82.6275),
+    "oskemen": ("Усть-Каменогорск", 49.9483, 82.6275),
+    "өскемен": ("Усть-Каменогорск", 49.9483, 82.6275),
+    "semey": ("Семей", 50.4111, 80.2275),
+    "семей": ("Семей", 50.4111, 80.2275),
+    "atyrau": ("Атырау", 47.0945, 51.9238),
+    "атырау": ("Атырау", 47.0945, 51.9238),
+    "kostanay": ("Костанай", 53.2144, 63.6246),
+    "костанай": ("Костанай", 53.2144, 63.6246),
+    "kyzylorda": ("Кызылорда", 44.8488, 65.4823),
+    "кызылорда": ("Кызылорда", 44.8488, 65.4823),
+    "қызылорда": ("Кызылорда", 44.8488, 65.4823),
+    "oral": ("Уральск", 51.2278, 51.3865),
+    "uralsk": ("Уральск", 51.2278, 51.3865),
+    "уральск": ("Уральск", 51.2278, 51.3865),
+    "петропавловск": ("Петропавловск", 54.8732, 69.1505),
+    "petropavl": ("Петропавловск", 54.8732, 69.1505),
+    "aktau": ("Актау", 43.6532, 51.1975),
+    "актау": ("Актау", 43.6532, 51.1975),
+    "turkistan": ("Туркестан", 43.2973, 68.2518),
+    "туркестан": ("Туркестан", 43.2973, 68.2518),
+    "kokshetau": ("Кокшетау", 53.2833, 69.3833),
+    "кокшетау": ("Кокшетау", 53.2833, 69.3833),
+    "taldykorgan": ("Талдыкорган", 45.0156, 78.3739),
+    "талдыкорган": ("Талдыкорган", 45.0156, 78.3739),
+    "zhezkazgan": ("Жезказган", 47.7833, 67.7000),
+    "жезказган": ("Жезказган", 47.7833, 67.7000),
+}
+
+
+def get_static_city(query: str) -> dict[str, Any] | None:
+    city = " ".join(query.strip().lower().replace("ё", "е").split())
+    static_city = STATIC_KZ_CITIES.get(city)
+    if not static_city:
+        return None
+
+    name, lat, lon = static_city
+    return {
+        "display_name": f"{name}, Казахстан",
+        "lat": lat,
+        "lon": lon,
+        "address": {"city": name, "country": "Казахстан"},
+    }
+
 
 async def fetch_json(url: str, params: dict[str, Any], timeout: int = 10) -> Any:
     try:
@@ -66,6 +129,10 @@ async def geocode_location(query: str) -> dict[str, Any] | None:
     city = query.strip()
     if not city:
         return None
+
+    static_city = get_static_city(city)
+    if static_city:
+        return static_city
 
     params = {
         "q": city,
@@ -177,22 +244,24 @@ async def root() -> dict[str, str]:
 @app.get("/api/prayer-times")
 async def get_prayer_times(
     location: Annotated[str | None, Query(description="Город, например Almaty")] = None,
+    city: Annotated[str | None, Query(description="Город, например Almaty")] = None,
 ) -> dict[str, Any]:
-    city = (location or "").strip() or "Astana"
+    requested_city = (location or city or "").strip() or "Shymkent"
 
-    geo = await geocode_location(city)
+    geo = await geocode_location(requested_city)
     if not geo:
         raise HTTPException(
             status_code=404,
-            detail=f"Место '{city}' не найдено. Попробуйте написать город иначе.",
+            detail=f"Место '{requested_city}' не найдено. Попробуйте написать город иначе.",
         )
 
     timezone = await get_timezone_info(geo["lat"], geo["lon"])
     prayer_times = await get_timings_by_coords(geo["lat"], geo["lon"])
+    found_city = await get_place_name(geo)
 
     return {
-        "city": city,
-        "searched": city,
+        "city": found_city,
+        "searched": requested_city,
         "found": geo["display_name"],
         "coordinates": {
             "lat": geo["lat"],
